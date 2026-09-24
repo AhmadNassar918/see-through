@@ -13,6 +13,12 @@ from modules.layerdiffuse.vae import TransparentVAEDecoder, TransparentVAEEncode
 from .layerdiff3d import UNetFrameConditionModel
 from utils.torch_utils import seed_everything, img2tensor, tensor2img
 
+# The LayerDiff3D checkpoint carries its own `scheduler/scheduler_config.json`, and it
+# describes exactly the scheduler the `scheduler is None` branch below needs
+# (DPMSolverMultistepScheduler with algorithm_type="sde-dpmsolver++" and
+# final_sigmas_type="zero"). Prefer that copy so the branch also works without network.
+LAYERDIFF3D_REPO_ID = "layerdifforg/seethroughv0.0.2_layerdiff3d"
+
 @dataclass
 class LayerdiffPipelineOutput(BaseOutput):
     """
@@ -120,11 +126,44 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             scheduler_name = "DPMPP_2M_SDE"
             scheduler_config_name = "zero"
             scheduler_configs = schedulers[scheduler_name]
-            scheduler = scheduler_configs[scheduler_config_name][0].from_pretrained(
-                    model_id,
-                    subfolder="scheduler",
-                    **scheduler_configs[scheduler_config_name][1],
-            )
+            scheduler_cls, scheduler_kwargs = scheduler_configs[scheduler_config_name]
+            # `model_id` is a separate Hub repo that is usually *not* in the local cache,
+            # so with `local_files_only=True` (offline use) this branch fails with
+            # "... does not appear to have a file named scheduler_config.json".
+            # The LayerDiff3D checkpoint already ships an equivalent scheduler config, so
+            # read from there first and only fall back to the Hub when nothing is cached.
+            scheduler = None
+            for repo_id in (LAYERDIFF3D_REPO_ID, model_id):
+                try:
+                    scheduler = scheduler_cls.from_pretrained(
+                            repo_id,
+                            subfolder="scheduler",
+                            local_files_only=True,
+                            **scheduler_kwargs,
+                    )
+                    break
+                except Exception:
+                    scheduler = None
+            if scheduler is None:
+                # Nothing usable is cached locally, so build the scheduler straight from
+                # the values declared by the LayerDiff3D checkpoint instead of reaching
+                # for the Hub: an offline run must not depend on a network round-trip.
+                scheduler = scheduler_cls.from_config({
+                        "num_train_timesteps": 1000,
+                        "beta_start": 0.00085,
+                        "beta_end": 0.012,
+                        "beta_schedule": "scaled_linear",
+                        "trained_betas": None,
+                        "prediction_type": "epsilon",
+                        "thresholding": False,
+                        "skip_prk_steps": True,
+                        "set_alpha_to_one": False,
+                        "steps_offset": 1,
+                        "timestep_spacing": "leading",
+                        "sample_max_value": 1.0,
+                        "clip_sample": False,
+                        **scheduler_kwargs,
+                })
 
         super().__init__(
             vae=vae, text_encoder=text_encoder, text_encoder_2=text_encoder_2, tokenizer=tokenizer, tokenizer_2=tokenizer_2,
